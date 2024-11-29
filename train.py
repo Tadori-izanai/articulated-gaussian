@@ -5,12 +5,21 @@ import copy
 import numpy as np
 from PIL import Image
 from random import randint
+
+from gmpy2 import denom
 from tqdm import tqdm
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, weighted_l2_loss_v2, quat_mult, \
     o3d_knn, params2rendervar, params2cpu, save_params
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
 
+from scene.dataset_readers import sceneLoadTypeCallbacks, SceneInfo
+from utils.camera_utils import camera_to_JSON
+from scene import SceneLite
+from scene.gaussian_model import mkdir_p
+from helpers import convert_camera
+from external import densification
+from scene.gaussian_model import GaussianModelLite
 
 def get_dataset(t, md, seq):
     dataset = []
@@ -24,6 +33,15 @@ def get_dataset(t, md, seq):
         seg = torch.tensor(seg).float().cuda()
         seg_col = torch.stack((seg, torch.zeros_like(seg), 1 - seg))
         dataset.append({'cam': cam, 'im': im, 'seg': seg_col, 'id': c})
+    return dataset
+
+def get_data(scene: SceneLite) -> list[dict]:
+    train_cameras = scene.get_train_cameras().copy()
+    dataset = []
+    for idx, tc in enumerate(train_cameras):
+        cam = convert_camera(tc)
+        im = tc.original_image
+        dataset.append({'cam': cam, 'im': im, 'id': idx})
     return dataset
 
 
@@ -60,6 +78,31 @@ def initialize_params(seq, md):
                  'denom': torch.zeros(params['means3D'].shape[0]).cuda().float()}
     return params, variables
 
+def init_params(scene: SceneLite) -> tuple[dict, dict]:
+    init_pt_cld = scene.pcd
+    num_pts = init_pt_cld.points.shape[0]
+    sq_dist, _ = o3d_knn(init_pt_cld.points, 3)
+    mean3_sq_dist = sq_dist.mean(-1).clip(min=0.0000001)
+    params = {
+        'means3D': init_pt_cld.points,
+        'rgb_colors': init_pt_cld.colors,
+        'unnorm_rotations': np.tile([1, 0, 0, 0], (num_pts, 1)),
+        'logit_opacities': np.zeros((num_pts, 1)),
+        'log_scales': np.tile(np.log(np.sqrt(mean3_sq_dist))[..., None], (1, 3)),
+    }
+    params = {
+        k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True))
+        for k, v in params.items()
+    }
+    cam_centers = np.array([c.camera_center.cpu().numpy() for c in scene.get_test_cameras()])
+    scene_radius = 1.1 * np.max(np.linalg.norm(cam_centers - np.mean(cam_centers, 0)[None], axis=-1))
+    variables = {
+        'max_2D_radius': torch.zeros(num_pts).cuda().float(),
+        'scene_radius': scene_radius,
+        'means2D_gradient_accum': torch.zeros(num_pts).cuda().float(),
+        'denom': torch.zeros(num_pts).cuda().float()
+    }
+    return params, variables
 
 def initialize_optimizer(params, variables):
     lrs = {
@@ -74,6 +117,32 @@ def initialize_optimizer(params, variables):
     }
     param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
     return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+
+def init_optimizer(params: dict, variables: dict) -> torch.optim.Optimizer:
+    lrs = {
+        'means3D': 0.00016 * variables['scene_radius'],
+        'rgb_colors': 0.0025,
+        'unnorm_rotations': 0.001,
+        'logit_opacities': 0.05,
+        'log_scales': 0.001,
+    }
+    param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
+    return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+
+def eval_loss(params: dict, curr_data: dict, variables: dict) -> tuple[torch.Tensor, dict, torch.Tensor, torch.Tensor]:
+    losses = {}
+    render_vars = params2rendervar(params)
+    render_vars['means2D'].retain_grad()
+    im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**render_vars)
+    losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
+    variables['means2D'] = render_vars['means2D']  # Gradient only accum from colour render for densification
+
+    loss_weights = {'im': 1.0}
+    loss = sum([loss_weights[k] * v for k, v in losses.items()])
+    seen = radius > 0
+    variables['max_2D_radius'][seen] = torch.max(radius[seen], variables['max_2D_radius'][seen])
+    variables['seen'] = seen
+    return loss, variables, im, curr_data['im']
 
 
 def get_loss(params, curr_data, variables, is_initial_timestep):
@@ -183,6 +252,43 @@ def report_progress(params, data, i, progress_bar, every_i=100):
         progress_bar.set_postfix({"train img 0 PSNR": f"{psnr:.{7}f}"})
         progress_bar.update(every_i)
 
+def report_prog(
+    loss: torch.Tensor, data_id: int, i: int, progress_bar: tqdm, every_i=100
+) -> None:
+    if i % every_i != 0:
+        return
+    # im, _, _ = Renderer(raster_settings=data['cam'])(**params2rendervar(params))
+    progress_bar.set_postfix({f"train img {data_id:03d} Loss": f"{loss:.{7}f}"})
+    progress_bar.update(every_i)
+
+
+def training(model_path: str, source_path: str, evaluate: bool, optm_args: dict) -> dict:
+    mkdir_p(model_path)
+    scene = SceneLite(model_path, source_path, evaluate)
+    scene.write_cfg_file()
+
+    params, variables = init_params(scene)
+    optimizer = init_optimizer(params, variables)
+
+    dataset = get_data(scene)
+    todo_dataset = []
+    tot_iterations = optm_args['iterations']
+    progress_bar = tqdm(range(tot_iterations), desc=f"timestep 0")
+    for i in range(tot_iterations):
+        curr_data = get_batch(todo_dataset, dataset)
+        loss, variables, im_render, im_gt = eval_loss(params, curr_data, variables)
+        loss.backward()
+        with torch.no_grad():
+            report_prog(loss, curr_data['id'], i, progress_bar)
+            params, variables = densification(params, variables, optimizer, i, optm_args)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+    progress_bar.close()
+
+    gaussians = GaussianModelLite.create_from_params({k: v.detach() for k, v in params.items()})
+    ply_path = os.path.join(scene.model_path, f"point_cloud/iteration_{optm_args['iterations']}/point_cloud.ply")
+    gaussians.save_ply(ply_path)
+    return params
 
 def train(seq, exp):
     if os.path.exists(f"./output/{exp}/{seq}"):
@@ -219,7 +325,19 @@ def train(seq, exp):
 
 
 if __name__ == "__main__":
-    exp_name = "exp1"
-    for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
-        train(sequence, exp_name)
-        torch.cuda.empty_cache()
+    # exp_name = "exp1"
+    # for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
+    #     train(sequence, exp_name)
+    #     torch.cuda.empty_cache()
+
+    output_path = './output/usb'
+    data_path = './data/usb/start'
+    optm_args = {
+        'iterations': 30_000,
+        'densify_until_iter': 15000,
+        'densify_from_iter': 500,
+        'densify_grad_threshold': 2e-4,
+        'densification_interval': 100,
+        'opacity_reset_interval': 3000,
+    }
+    training(output_path, data_path, True, optm_args)

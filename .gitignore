@@ -1,4 +1,8 @@
 __pycache__/
 .idea/
+.vscode/
 data/
 output/
+diff-gaussian-rasterization-w-depth/
+test.ipynb
+.ipynb_checkpoints

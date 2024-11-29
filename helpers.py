@@ -2,7 +2,10 @@ import torch
 import os
 import open3d as o3d
 import numpy as np
-from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
+from diff_gaussian_rasterization import GaussianRasterizationSettings
+
+import math
+from scene.cameras import Camera
 
 
 def setup_camera(w, h, k, w2c, near=0.01, far=100):
@@ -15,7 +18,7 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100):
                                 [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
                                 [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
     full_proj = w2c.bmm(opengl_proj)
-    cam = Camera(
+    cam = GaussianRasterizationSettings(
         image_height=h,
         image_width=w,
         tanfovx=w / (2 * fx),
@@ -30,6 +33,22 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100):
     )
     return cam
 
+def convert_camera(viewpoint_camera: Camera) -> GaussianRasterizationSettings:
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    return GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"),
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=0,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False
+    )
 
 def params2rendervar(params):
     rendervar = {
